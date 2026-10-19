@@ -1,341 +1,268 @@
 # Scan-Red
 
-Escáner de red local para Windows (PowerShell). Descubre dispositivos por **IP, MAC, nombre y fabricante**, escanea **puertos TCP**, detecta **dispositivos nuevos, desaparecidos y cambios de IP**, calcula la **presencia histórica**, genera reportes **CSV/HTML** y envía **alertas** (toast de Windows, Telegram y/o email).
+Escáner de red local multiplataforma, escrito en Python. Descubre equipos con
+ping/ARP, resuelve nombres, identifica fabricantes por OUI, guarda historial de
+altas y bajas, exporta CSV/JSON y, opcionalmente, escanea puertos TCP.
+
+La versión PowerShell original (con alertas, lista blanca, vigilancia continua,
+HTML y presencia histórica) se conserva en [`legacy/`](legacy/README.md).
+
+> **Uso responsable:** ejecuta Scan-Red solo en redes que administres o para las
+> que tengas autorización escrita. El flag `--autorizado` es obligatorio.
+
+---
 
 ## Características
 
-- **Descubrimiento rápido**: ping sweep asíncrono (los 254 hosts en ~1 segundo) + tabla ARP.
-- **Identificación**: DNS inverso, NetBIOS opcional y fabricante por prefijo OUI (con caché local).
-- **Puertos TCP**: escaneo paralelo de los puertos que definas, con nombre de servicio.
-- **Lista blanca**: marca tus equipos conocidos como autorizados.
-- **Detección de cambios**: `NUEVO` / `Conocido`, desaparecidos y cambios de IP (usando la MAC como identidad).
-- **Historial y presencia**: porcentaje de escaneos en los que apareció cada dispositivo.
-- **Modo vigilancia**: repite el escaneo cada N segundos y solo reporta cambios.
-- **Alertas**: toast de Windows, Telegram y email, con registro en `alertas.log`.
-- **Reportes**: CSV (Excel) y HTML autocontenido, sin dependencias externas.
+- **Ping sweep** concurrente sobre un rango de la LAN.
+- **Tabla ARP/neighbor** multiplataforma (Windows, Linux, macOS), con
+  normalización de MAC y detección de equipos que no responden a ICMP pero sí
+  están en la red.
+- **DNS inverso** en paralelo y **NetBIOS** opcional en Windows (`--netbios`).
+- **Fabricante por OUI** con caché local, límite de peticiones y fallback entre
+  dos APIs. Se puede desactivar con `--sin-fabricante`.
+- **Historial** de equipos nuevos, conocidos y desaparecidos. La MAC es la
+  identidad estable; si no hay MAC se usa la IP.
+- **CSV y JSON** con puertos abiertos, fechas y estado.
+- **Escaneo de puertos TCP** opcional:
+  - `connect` (por defecto): sin privilegios, conexión completa.
+  - `syn`: con `scapy`, requiere administrador/root y Npcap en Windows.
+- **Salvaguarda legal** integrada en la librería, no solo en la CLI.
 
 ## Requisitos
 
-- Windows 8 / 10 / 11 o Windows Server 2012+
-- Windows PowerShell 5.1 o PowerShell 7+
-- Internet **opcional** (solo para resolver fabricantes y enviar Telegram/email)
-
-No requiere módulos externos: usa solo PowerShell y .NET.
+- Python **3.10 o superior**.
+- Windows, Linux o macOS.
+- Para el motor `syn`: `pip install "scan-red[syn]"` + permisos elevados
+  (Npcap en Windows).
+- Internet solo si quieres resolver fabricantes por OUI.
 
 ## Instalación
 
 ```powershell
 git clone https://github.com/bydavidp/Scan-Red.git
 cd Scan-Red
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Uso normal
+python -m pip install -e .
+
+# Desarrollo (pytest + ruff)
+python -m pip install -e ".[dev]"
+
+# Motor SYN opcional
+python -m pip install -e ".[syn]"
+```
+
+En Linux/macOS la activación es `source .venv/bin/activate`.
+
+El comando instalado es `scan-red`. También puedes ejecutar el paquete sin
+instalarlo, desde la raíz del repositorio:
+
+```powershell
+python -m scan_red --autorizado
 ```
 
 ## Uso rápido
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scan-red.ps1
+# Escaneo por defecto: 192.168.1.1-254, historial y CSV
+scan-red --autorizado
+
+# Rango concreto
+scan-red --red 192.168.0 --inicio 1 --fin 100 --autorizado
+
+# Puertos TCP (connect)
+scan-red --autorizado --puertos 22,80,443,3389
+
+# Rango de puertos
+scan-red --autorizado --puertos 1-1024
+
+# Motor SYN (scapy + administrador)
+scan-red --autorizado --puertos 80,443 --motor-puertos syn
+
+# Sin consultar fabricantes (sin internet)
+scan-red --autorizado --sin-fabricante
+
+# Exportar también a JSON
+scan-red --autorizado --json reporte.json
 ```
 
-Eso escanea `192.168.1.1 - 192.168.1.254`, muestra la tabla y guarda los reportes en:
+### Parámetros
 
-```
-C:\Users\<usuario>\Reportes-Red\
-```
+| Parámetro | Equivalente PowerShell | Descripción |
+|---|---|---|
+| `-Red`, `--red` | `-Red` | Prefijo de 3 octetos. Por defecto `192.168.1`. |
+| `-Inicio`, `--inicio` | `-Inicio` | Primer octeto del rango. Por defecto `1`. |
+| `-Fin`, `--fin` | `-Fin` | Último octeto del rango. Por defecto `254`. |
+| `-TimeoutMs`, `--timeout-ms` | `-TimeoutMs` | Espera de ping en ms. Por defecto `800`. |
+| `-Carpeta`, `--carpeta` | `-Carpeta` | Carpeta de reportes. Por defecto `~/Reportes-Red`. |
+| `-Csv`, `--csv` | `-Csv` | Nombre/ruta del CSV (relativo a `-Carpeta`). |
+| `--json` | — | Exporta además un JSON. |
+| `-SinCsv`, `--sin-csv` | `-SinCsv` | No genera CSV. |
+| `-SinHistorial`, `--sin-historial` | `-SinHistorial` | No lee ni guarda estado anterior. |
+| `-SinFabricante`, `--sin-fabricante` | `-SinFabricante` | No consulta fabricantes. |
+| `--netbios` | `-NetBios` | Prueba NetBIOS si falla el DNS inverso. |
+| `--puertos` | `-Puertos` | Lista/rango de puertos TCP. Vacío = no escanear. |
+| `--motor-puertos` | — | `connect` (defecto) o `syn`. |
+| `--timeout-puerto` | `-TimeoutPuertoMs` | Timeout por conexión TCP, en segundos. |
+| `--solo-publicas` | — | Omite IPs privadas/reservadas. |
+| `--autorizado` | — | Confirmación legal **obligatoria**. |
+| `-v`, `--verbose` | — | `-v` info, `-vv` debug. |
+| `--version` | — | Muestra la versión. |
 
-## Configuración
+## Migración desde PowerShell
 
-Copia el ejemplo y ajústalo:
+| PowerShell (`legacy/scan-red.ps1`) | Python (`scan-red`) |
+|---|---|
+| `.\scan-red.ps1` | `scan-red --autorizado` |
+| `-Red 192.168.0 -Inicio 1 -Fin 100` | igual, con `--red`, `--inicio`, `--fin` |
+| `-Carpeta C:\Reportes` | `-Carpeta C:\Reportes` |
+| `-Csv salida.csv` | `-Csv salida.csv` |
+| `-SinCsv`, `-SinHistorial`, `-SinFabricante` | mismos nombres |
+| `-NetBios` | `--netbios` |
+| `-Puertos 22,80,443` | `--puertos 22,80,443` |
+| `-EscanearPuertos` | se activa al pasar `--puertos` |
+| `-Vigilar`, `-Veces`, `-IntervaloSeg` | no portado: usa el Programador de tareas o `cron` |
+| `-ResumenHistorial` | no portado |
+| `-Autorizar MAC` | no portado: la lista blanca vive en `legacy/config.json` |
 
-```powershell
-Copy-Item config.example.json config.json
-```
+### Alcance de esta reescritura
 
-`config.json` **no se sube al repositorio** (puede contener secretos). Precedencia:
+| Función | Python | PowerShell legacy |
+|---|---|---|
+| Ping / ARP / DNS / OUI | Sí | Sí |
+| Historial nuevo/conocido/desaparecido | Sí | Sí |
+| CSV | Sí | Sí |
+| JSON | Sí | — |
+| Puertos `connect` | Sí | Sí |
+| Puertos `syn` | Sí (`scapy`) | — |
+| NetBIOS | Sí (opt-in) | Sí |
+| Alertas toast / Telegram / email | — | Sí |
+| Lista blanca | — | Sí |
+| Vigilancia continua | — | Sí |
+| Reporte HTML | — | Sí |
+| Presencia histórica | — | Sí |
+| Configuración `config.json` | — (flags) | Sí |
 
-```
-valores por defecto  <  config.json  <  parámetros de la línea de comandos
-```
+El objetivo de esta rama es portar el núcleo del escáner y añadir el motor de
+puertos. Las funciones de la versión 2 de PowerShell siguen disponibles en
+`legacy/` y pueden portarse en una siguiente fase.
 
-Ejemplo de configuración:
+## Historial y compatibilidad
 
-```json
-{
-  "Red": "192.168.1",
-  "Inicio": 1,
-  "Fin": 254,
-  "CarpetaReportes": "Reportes-Red",
-  "GenerarCsv": true,
-  "GenerarHtml": true,
-  "GuardarHistorial": true,
-  "CompararEstado": true,
-  "UsarFabricantes": true,
-  "EscanearPuertos": true,
-  "Puertos": [22, 80, 443, 554, 3389, 8000, 8080, 8443, 37777],
-  "TimeoutPuertoMs": 250,
-  "Vigilar": false,
-  "Intervalo": 300,
-  "Veces": 0,
-  "ListaBlanca": ["AA-BB-CC-DD-EE-FF"],
-  "IgnorarMacAleatoria": true,
-  "Notificaciones": {
-    "Toast": true,
-    "SoloNoAutorizados": true,
-    "Telegram": {
-      "Activo": false,
-      "BotToken": "",
-      "BotTokenEnv": "SCANRED_TELEGRAM_TOKEN",
-      "ChatId": ""
-    },
-    "Email": {
-      "Activo": false,
-      "Servidor": "smtp.gmail.com",
-      "Puerto": 587,
-      "UsarSsl": true,
-      "Usuario": "tu-correo@gmail.com",
-      "Password": "",
-      "PasswordEnv": "SCANRED_SMTP_PASS",
-      "Para": "tu-correo@gmail.com"
-    }
-  }
-}
-```
+- El estado se guarda en `<Carpeta>/estado-anterior.json`.
+- La clave es la **MAC**; si el equipo no tiene MAC, `IP:<ip>`.
+- Se guardan varias IPs por MAC (por ejemplo, cámaras con dos direcciones).
+- El JSON incluye claves en `snake_case` y en `PascalCase` (`IPs`,
+  `PrimeraVez`, `UltimoVisto`, ...) para que la versión PowerShell pueda leerlo
+  y escribir en el mismo archivo.
+- `--sin-historial` no lee ni escribe el estado; todos los equipos aparecen con
+  `Cambio = "-"`.
+- Un equipo "desaparecido" es el que estaba en el estado anterior y no apareció
+  en este escaneo. Se muestra una vez y deja de estar en el estado guardado.
 
-## Parámetros
-
-| Parámetro | Descripción |
-|-----------|-------------|
-| `-Config <ruta>` | Archivo de configuración (por defecto `config.json`). |
-| `-Red <prefijo>` | Red sin el último octeto. Ej: `192.168.1`. |
-| `-TimeoutMs <ms>` | Espera por ping (por defecto 800). |
-| `-Inicio` / `-Fin` | Rango del último octeto (1 a 254). |
-| `-Carpeta <ruta>` | Carpeta de reportes. |
-| `-Csv <ruta>` / `-Html <ruta>` | Nombre o ruta de los reportes (relativo = dentro de `-Carpeta`). |
-| `-SinCsv` / `-SinHtml` | No generar ese reporte. |
-| `-SinHistorial` | No guardar historial acumulado. |
-| `-SinEstado` | No comparar con el escaneo anterior (sin nuevos/desaparecidos). |
-| `-SinFabricante` | No consultar fabricantes (funciona sin internet). |
-| `-SinNombres` | No resolver nombres. |
-| `-NetBios` | Intentar nombres por NetBIOS cuando el DNS inverso falla. |
-| `-EscanearPuertos` / `-SinPuertos` | Activar/desactivar el escaneo de puertos. |
-| `-Puertos 22,80,443` | Puertos TCP a escanear. |
-| `-TimeoutPuertoMs <ms>` | Espera por conexión TCP. |
-| `-Vigilar` | Modo continuo. |
-| `-Intervalo <seg>` | Segundos entre escaneos (mínimo 10). |
-| `-Veces <n>` | Número de escaneos antes de salir (0 = infinito). |
-| `-Autorizar <MAC>` | Agrega una o varias MAC a la lista blanca y sale. |
-| `-ResumenHistorial` | Muestra el resumen de presencia histórica y sale. |
-
-### Ejemplos
-
-```powershell
-# Escaneo normal
-.\scan-red.ps1
-
-# Otra red y rango
-.\scan-red.ps1 -Red 192.168.0 -Inicio 1 -Fin 100
-
-# Vigilancia cada 5 minutos
-.\scan-red.ps1 -Vigilar -Intervalo 300
-
-# Vigilancia limitada a 3 escaneos (útil para probar)
-.\scan-red.ps1 -Vigilar -Veces 3 -Intervalo 15
-
-# Autorizar un dispositivo por su MAC
-.\scan-red.ps1 -Autorizar 74-A7-EA-30-75-3F
-
-# Ver presencia histórica
-.\scan-red.ps1 -ResumenHistorial
-
-# Sin internet y sin puertos
-.\scan-red.ps1 -SinFabricante -SinPuertos
-```
-
-## Lista blanca
-
-```powershell
-.\scan-red.ps1 -Autorizar AA-BB-CC-DD-EE-FF
-```
-
-- La MAC se normaliza (`aabbccddeeff` → `AA-BB-CC-DD-EE-FF`).
-- Se guarda en `config.json` → `ListaBlanca`.
-- Los equipos autorizados aparecen como `Autorizado = Si`.
-- Con `SoloNoAutorizados: true`, solo se alerta de los **no** autorizados.
-- Los equipos con **MAC aleatoria** (bit localmente administrado) se pueden ignorar con `IgnorarMacAleatoria: true`.
-
-## Notificaciones
-
-### Toast de Windows
-
-Activado por defecto (`"Toast": true`). No requiere configuración adicional.
-
-### Telegram
-
-1. Crea un bot con [@BotFather](https://t.me/BotFather) y copia el **token**.
-2. Envía un mensaje al bot (para que exista el chat).
-3. Obtén el `chat_id`:
-
-```powershell
-Invoke-RestMethod "https://api.telegram.org/bot<TU_TOKEN>/getUpdates" |
-    Select-Object -ExpandProperty result |
-    Select-Object -ExpandProperty message |
-    Select-Object -ExpandProperty chat
-```
-
-4. Configura `ChatId` y el token:
-
-```powershell
-# Recomendado: variable de entorno (no queda en config.json)
-$env:SCANRED_TELEGRAM_TOKEN = "123456:ABC..."
-```
-
-O escríbelo en `Notificaciones.Telegram.BotToken` y pon `"Activo": true`.
-
-### Email
-
-```json
-"Email": {
-  "Activo": true,
-  "Servidor": "smtp.gmail.com",
-  "Puerto": 587,
-  "UsarSsl": true,
-  "Usuario": "tu-correo@gmail.com",
-  "Password": "",
-  "PasswordEnv": "SCANRED_SMTP_PASS",
-  "Para": "tu-correo@gmail.com"
-}
-```
-
-```powershell
-$env:SCANRED_SMTP_PASS = "tu-password-de-aplicacion"
-```
-
-Para Gmail necesitas una **contraseña de aplicación** (con verificación en dos pasos activa).
-
-Todas las alertas se registran además en `Reportes-Red/alertas.log`.
-
-## Modo vigilancia
-
-```powershell
-.\scan-red.ps1 -Vigilar -Intervalo 300
-```
-
-- El **primer** escaneo muestra la tabla completa.
-- Los siguientes solo muestran **cambios**.
-- En modo vigilancia, los CSV/HTML solo se generan cuando hay cambios (para no llenar la carpeta).
-- El historial acumulado sí se actualiza en cada vuelta.
-- Detén con `Ctrl+C`.
-
-## Escaneo de puertos
-
-Usa conexiones TCP (sin privilegios de administrador). Puertos comunes reconocidos:
-
-| Puerto | Servicio |
-|--------|----------|
-| 21 | FTP |
-| 22 | SSH |
-| 80 / 8080 | HTTP |
-| 443 / 8443 | HTTPS |
-| 554 / 8554 | RTSP (cámaras) |
-| 139 / 445 | NetBIOS / SMB |
-| 3389 | RDP |
-| 37777 | Dahua |
-| 34567 | DVR |
-| 9100 | Impresora |
-
-El escaneo es **paralelo** y con timeout corto (250 ms por defecto), así que no frena el escaneo principal.
-
-## Reportes y archivos generados
-
-Todo se guarda en la carpeta de reportes (`C:\Users\<usuario>\Reportes-Red` por defecto):
-
-| Archivo | Contenido |
-|---------|-----------|
-| `scan-red-AAAAMMDD-HHMMSS.csv` | Reporte de la ejecución (Excel). |
-| `reporte-AAAAMMDD-HHMMSS.html` | Reporte visual autocontenido. |
-| `historial.csv` | Historial acumulado (una fila por dispositivo y escaneo). |
-| `historial-resumen.json` | Estadísticas de presencia. |
-| `estado-anterior.json` | Estado del último escaneo (para comparar). |
-| `alertas.log` | Registro de alertas enviadas. |
-| `config.json` | Configuración local (en la carpeta del script). |
-| `.scan-red-oui-cache.json` | Caché de fabricantes (en el perfil del usuario). |
-
-### Columnas del CSV
-
-| Columna | Descripción |
-|---------|-------------|
-| `IP` | Dirección IPv4. |
-| `MAC` | Dirección física (identidad estable). |
-| `Nombre` | Nombre por DNS/NetBIOS, si existe. |
-| `Fabricante` | Fabricante según el prefijo OUI. |
-| `Autorizado` | `Si`, `No` o `-` (sin MAC). |
-| `MacAleatoria` | `Si` si la MAC es localmente administrada/aleatoria. |
-| `PuertosTexto` | Puertos abiertos con su servicio. |
-| `Estado` | `Activo` (responde ping) o `Solo ARP`. |
-| `Ms` | Tiempo de respuesta del ping. |
-| `Cambio` | `NUEVO` o `Conocido`. |
-| `PrimeraVez` | Primer avistamiento. |
-| `UltimoVisto` | Último escaneo en que apareció. |
-| `Presencia` | Porcentaje de escaneos en que apareció (0-100). |
-
-## Presencia histórica
-
-```powershell
-.\scan-red.ps1 -ResumenHistorial
-```
-
-Muestra cada dispositivo con:
-
-- **Presencia**: % de escaneos en que apareció.
-- **Veces**: número de escaneos en que se vio.
-- **PrimeraVez** / **UltimoVisto**: fechas.
-
-La presencia es una **aproximación** basada en escaneos, no un uptime real.
-
-### Reiniciar el historial
-
-```powershell
-# Borrar solo las estadísticas de presencia
-Remove-Item "$HOME\Reportes-Red\historial-resumen.json"
-
-# Borrar también el historial detallado
-Remove-Item "$HOME\Reportes-Red\historial.csv"
-
-# Reiniciar la detección de cambios (la próxima corrida es línea base)
-Remove-Item "$HOME\Reportes-Red\estado-anterior.json"
-```
-
-### Limpiar reportes
-
-```powershell
-Remove-Item "$HOME\Reportes-Red\scan-red-*.csv"
-Remove-Item "$HOME\Reportes-Red\reporte-*.html"
-```
+> La presencia es aproximada: se basa en los escaneos, no es uptime real.
 
 ## Cómo funciona
 
-1. **Ping sweep** asíncrono a todo el rango.
-2. **ARP** (`Get-NetNeighbor`, con respaldo a `arp -a`) para obtener MACs.
-3. **Nombres**: DNS inverso en paralelo; NetBIOS opcional.
-4. **Fabricante**: `api.macvendors.com` (respaldo `api.maclookup.app`), con caché y límite de ~1 consulta/segundo.
-5. **Puertos**: conexiones TCP asíncronas en paralelo.
-6. **Comparación**: agrupa por MAC, detecta nuevos, desaparecidos y cambios de IP.
-7. **Historial**: acumula y calcula presencia.
-8. **Salida**: consola + CSV + HTML + alertas.
+1. Ping sweep concurrente (64 procesos a la vez) sobre el rango.
+2. Lectura de la tabla ARP/neighbor del sistema.
+3. Unión de IPs que respondieron a ping o que están en ARP.
+4. DNS inverso en paralelo; NetBIOS opcional.
+5. Fabricante por OUI, con caché en `~/.scan-red-oui-cache.json` y 1 petición/s.
+6. Comparación con el estado anterior.
+7. Escaneo TCP de los puertos indicados, sobre todos los equipos descubiertos.
+8. Salida por consola, CSV/JSON y guardado del estado.
+
+### Puertos
+
+- `connect` abre conexiones TCP reales. No necesita privilegios, pero queda
+  registrado en los logs del equipo escaneado. Límite por defecto: 500
+  conexiones/s y 200 en paralelo.
+- `syn` envía paquetes SYN y no completa la conexión. Requiere `scapy`,
+  permisos elevados y Npcap en Windows.
+- `--solo-publicas` omite IPs privadas, loopback, link-local, multicast y
+  rangos reservados. En una LAN normal no escaneará nada; es una protección
+  para usos concretos sobre IPs públicas autorizadas.
+- Los puertos se muestran en la columna `PUERTOS` y en `PuertosAbiertos` del
+  CSV, separados por comas.
+
+## Columnas del CSV
+
+`IP, MAC, Nombre, Fabricante, Estado, Ms, PrimeraVez, UltimoVisto, Cambio,
+PuertosAbiertos`
+
+El CSV se escribe en **UTF-8 con BOM** (`utf-8-sig`) para que Excel lo abra
+correctamente.
+
+## Estructura
+
+```text
+scan_red/
+├── __init__.py
+├── __main__.py
+├── cli.py
+├── discovery.py
+├── exporters.py
+├── history.py
+├── models.py
+└── portscanner/
+    ├── __init__.py
+    ├── connect.py
+    ├── legal.py
+    └── syn.py
+tests/
+legacy/            # versión PowerShell original
+pyproject.toml
+```
+
+## Pruebas y calidad
+
+```powershell
+python -m pytest -q
+ruff check scan_red tests
+ruff format --check scan_red tests
+```
+
+La suite cubre salvaguardas legales, parseo ARP (Windows/Linux/MAC con puntos),
+normalización de MAC/OUI, historial (incluida compatibilidad con PowerShell),
+exportadores, CLI y escaneo `connect` contra un servidor local.
 
 ## Limitaciones
 
-- Un dispositivo puede **bloquear el ping** y aun así estar en la red: aparece como `Solo ARP`.
-- Las **MAC aleatorias** (celulares modernos) rotan y pueden aparecer como `NUEVO` periódicamente; se pueden ignorar con `IgnorarMacAleatoria`.
-- Las entradas ARP pueden tardar en expirar: un equipo desconectado puede tardar en marcarse como desaparecido.
-- Redes con **AP isolation** pueden ocultar clientes entre sí.
-- El escaneo de puertos es TCP connect: no detecta servicios solo UDP.
-- Las notificaciones requieren que el script esté corriendo (no es un servicio de Windows).
+- El ping se hace con el binario del sistema: 254 procesos por escaneo
+  (limitados a 64 concurrentes). Es portable, pero más lento que ICMP nativo.
+- El RTT se toma de la salida de `ping`; si el idioma no coincide con el patrón,
+  se usa el tiempo total del proceso como aproximación.
+- La tabla ARP puede tardar en poblarse tras el ping; algunos equipos aparecen
+  como "Solo ARP" en el primer escaneo.
+- En Linux, `ip neigh` es la fuente principal; si no existe, se usa `arp -an`.
+- `syn` no está cubierto por la suite si `scapy` no está instalado.
+- No se portaron alertas, lista blanca, vigilancia, HTML ni presencia histórica.
 
-## Seguridad
+## Seguridad y datos
 
-- `config.json` está en `.gitignore` porque puede contener el token de Telegram y la contraseña SMTP.
-- Prefiere variables de entorno (`SCANRED_TELEGRAM_TOKEN`, `SCANRED_SMTP_PASS`) antes que texto plano.
-- Los CSV, el historial y el estado también están ignorados: contienen IPs y MACs privadas.
+- `config.json`, los reportes, los CSV y el estado están en `.gitignore`: pueden
+  contener IPs, MACs y nombres de tu red.
+- No subas reportes ni configuraciones con secretos al repositorio.
+- La caché OUI solo guarda el prefijo de 6 caracteres y el nombre del fabricante.
 
-## Aviso de uso
+## Versión PowerShell (legacy)
 
-Usa esta herramienta **solo en redes que administres o para las que tengas autorización explícita**. Escanear redes ajenas sin permiso puede ser ilegal.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\legacy\scan-red.ps1 -Red 192.168.1
+```
+
+Consulta [`legacy/README.md`](legacy/README.md) para alertas, lista blanca,
+vigilancia, HTML y configuración. El estado `estado-anterior.json` es compatible
+entre ambas versiones.
+
+## Aviso legal
+
+Scan-Red está pensado para auditorías de redes propias o expresamente
+autorizadas. Escanear redes de terceros sin permiso puede ser ilegal y está
+fuera del propósito de este proyecto. El uso de `--puertos` no cambia esa
+responsabilidad: el flag `--autorizado` confirma que tienes autorización.

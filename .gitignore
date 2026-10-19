@@ -5,6 +5,7 @@ config.json
 Reportes-Red/
 *.csv
 *.html
+historial.csv
 historial-resumen.json
 estado-anterior.json
 alertas.log
@@ -12,6 +13,20 @@ alertas.log
 
 # Cache de fabricantes (OUI)
 .scan-red-oui-cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+.coverage
+htmlcov/
 
 # Temporales
 *.tmp

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scan-red"
+version = "2.0.0"
+description = "Escaner de red local (LAN + puertos TCP) multiplataforma"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+syn = ["scapy>=2.5"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+scan-red = "scan_red.cli:main"
+
+[project.urls]
+Repository = "https://github.com/bydavidp/Scan-Red"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scan_red"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
