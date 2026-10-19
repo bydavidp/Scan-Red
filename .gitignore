@@ -1,0 +1,10 @@
+# Datos de ejecucion: contienen IPs y MACs privadas de la red local
+Reportes-Red/
+*.csv
+estado-anterior.json
+.scan-red-oui-cache.json
+
+# Temporales
+*.log
+*.tmp
+*.bak
