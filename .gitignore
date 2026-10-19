@@ -1,10 +1,18 @@
-# Datos de ejecucion: contienen IPs y MACs privadas de la red local
+# Configuracion local (puede contener secretos: token de Telegram, password SMTP)
+config.json
+
+# Reportes y datos de ejecucion (contienen IPs y MACs privadas de la red local)
 Reportes-Red/
 *.csv
+*.html
+historial-resumen.json
 estado-anterior.json
+alertas.log
+*.log
+
+# Cache de fabricantes (OUI)
 .scan-red-oui-cache.json
 
 # Temporales
-*.log
 *.tmp
 *.bak

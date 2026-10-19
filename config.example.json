@@ -1,0 +1,40 @@
+{
+  "Red": "192.168.1",
+  "TimeoutMs": 800,
+  "Inicio": 1,
+  "Fin": 254,
+  "CarpetaReportes": "Reportes-Red",
+  "GenerarCsv": true,
+  "GenerarHtml": true,
+  "GuardarHistorial": true,
+  "CompararEstado": true,
+  "UsarFabricantes": true,
+  "EscanearPuertos": true,
+  "Puertos": [22, 80, 443, 554, 3389, 8000, 8080, 8443, 37777],
+  "TimeoutPuertoMs": 250,
+  "Vigilar": false,
+  "Intervalo": 300,
+  "Veces": 0,
+  "ListaBlanca": [],
+  "IgnorarMacAleatoria": true,
+  "Notificaciones": {
+    "Toast": true,
+    "SoloNoAutorizados": true,
+    "Telegram": {
+      "Activo": false,
+      "BotToken": "",
+      "BotTokenEnv": "SCANRED_TELEGRAM_TOKEN",
+      "ChatId": ""
+    },
+    "Email": {
+      "Activo": false,
+      "Servidor": "smtp.gmail.com",
+      "Puerto": 587,
+      "UsarSsl": true,
+      "Usuario": "",
+      "Password": "",
+      "PasswordEnv": "SCANRED_SMTP_PASS",
+      "Para": ""
+    }
+  }
+}

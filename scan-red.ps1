@@ -1,91 +1,149 @@
 <#
 .SYNOPSIS
-    Escanea la red local (ping sweep), identifica dispositivos por IP, MAC, nombre y fabricante,
-    detecta dispositivos nuevos/desaparecidos respecto al escaneo anterior y guarda todo en
-    una carpeta de reportes centralizada.
+    Scan-Red: escaner de red local con alertas, historial y reportes.
 
 .DESCRIPTION
-    Fase 1: lanza pings en paralelo a todo el rango (por defecto 192.168.1.1 - 192.168.1.254).
-    Fase 2: lee la tabla ARP/vecinos para obtener las direcciones MAC.
-    Fase 3: resuelve nombres por DNS inverso (y opcionalmente NetBIOS con -NetBios).
-    Fase 4: consulta el fabricante por MAC (OUI) usando internet + cache local.
-    Fase 5: compara con el escaneo anterior: marca NUEVO / Conocido / Desaparecido.
-    Fase 6: muestra la tabla, guarda el CSV y actualiza el historial.
+    Descubre dispositivos de la red local (ping + ARP), resuelve nombre y fabricante,
+    escanea puertos TCP, compara con el escaneo anterior (nuevos/desaparecidos/cambios
+    de IP), calcula la presencia historica, genera reportes CSV/HTML y envia alertas
+    (toast de Windows, Telegram y/o email).
+
+.PARAMETER Config
+    Ruta de config.json. Por defecto: config.json junto al script.
 
 .PARAMETER Red
     Prefijo de red sin el ultimo octeto. Ej: 192.168.1
 
 .PARAMETER TimeoutMs
-    Milisegundos de espera por cada ping. Por defecto 800.
+    Milisegundos de espera por cada ping.
 
 .PARAMETER Inicio / Fin
-    Rango del ultimo octeto. Por defecto 1 a 254.
+    Rango del ultimo octeto (por defecto 1 a 254).
 
 .PARAMETER Carpeta
-    Carpeta donde se guardan los CSV y el historial. Por defecto: C:\Users\<usuario>\Reportes-Red
+    Carpeta de reportes. Por defecto: $HOME\Reportes-Red
 
-.PARAMETER Csv
-    Ruta o nombre del CSV de salida. Si no se indica, se genera con fecha/hora dentro de -Carpeta.
+.PARAMETER Csv / Html
+    Nombre o ruta del reporte. Si es relativo, se guarda en -Carpeta.
 
-.PARAMETER SinCsv
-    No genera archivo CSV (el historial si se actualiza).
+.PARAMETER Puertos
+    Lista de puertos TCP a escanear. Ej: 22,80,443,554
 
-.PARAMETER NetBios
-    Intenta resolver nombres con nbtstat cuando el DNS inverso falla (mas lento).
+.PARAMETER Vigilar
+    Modo continuo: repite el escaneo cada -Intervalo segundos.
 
-.PARAMETER SinFabricante
-    No consulta el fabricante por MAC (OUI). Util si no hay internet.
+.PARAMETER Intervalo
+    Segundos entre escaneos en modo vigilancia (minimo 10).
 
-.PARAMETER SinHistorial
-    No lee ni actualiza el historial (no detecta nuevos/desaparecidos).
+.PARAMETER Veces
+    Numero de escaneos antes de salir (0 = infinito en modo vigilancia).
+
+.PARAMETER Autorizar
+    Agrega una o varias MAC a la lista blanca y sale.
+
+.PARAMETER ResumenHistorial
+    Muestra el resumen de presencia historica y sale.
 
 .EXAMPLE
     .\scan-red.ps1
-    .\scan-red.ps1 -Red 192.168.0
-    .\scan-red.ps1 -Carpeta D:\Reportes -Csv red-casa.csv
-    .\scan-red.ps1 -SinFabricante -NetBios
+
+.EXAMPLE
+    .\scan-red.ps1 -Vigilar -Intervalo 300
+
+.EXAMPLE
+    .\scan-red.ps1 -Autorizar 74-A7-EA-30-75-3F
 #>
 [CmdletBinding()]
 param(
-    [string]$Red = "192.168.1",
-    [int]$TimeoutMs = 800,
-    [int]$Inicio = 1,
-    [int]$Fin = 254,
-    [string]$Carpeta = (Join-Path $HOME 'Reportes-Red'),
+    [string]$Config,
+    [string]$Red,
+    [int]$TimeoutMs,
+    [int]$Inicio,
+    [int]$Fin,
+    [string]$Carpeta,
     [string]$Csv,
+    [string]$Html,
+    [int[]]$Puertos,
+    [int]$TimeoutPuertoMs,
+    [int]$Intervalo,
+    [int]$Veces,
+    [string[]]$Autorizar,
+    [switch]$EscanearPuertos,
+    [switch]$SinPuertos,
+    [switch]$Vigilar,
     [switch]$SinCsv,
-    [switch]$NetBios,
+    [switch]$SinHtml,
+    [switch]$SinHistorial,
+    [switch]$SinEstado,
     [switch]$SinFabricante,
-    [switch]$SinHistorial
+    [switch]$SinNombres,
+    [switch]$NetBios,
+    [switch]$ResumenHistorial
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
-
-# PowerShell 5.1 necesita TLS 1.2 explicito para las consultas HTTPS
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
 # ------------------------------------------------------------------
-# Carpeta de reportes
+# Cargar librerias
 # ------------------------------------------------------------------
-if (-not (Test-Path $Carpeta)) {
-    New-Item -ItemType Directory -Path $Carpeta -Force | Out-Null
-}
+$raiz = $PSScriptRoot
 
-$rutaEstado = Join-Path $Carpeta 'estado-anterior.json'
-$estadoAnterior = @{}
-$hayHistorial = $false
-
-if (-not $SinHistorial -and (Test-Path $rutaEstado)) {
-    try {
-        (Get-Content $rutaEstado -Raw | ConvertFrom-Json).PSObject.Properties |
-            ForEach-Object { $estadoAnterior[$_.Name] = $_.Value }
-        $hayHistorial = $true
+foreach ($archivo in @('Common', 'Config', 'Discovery', 'Ports', 'History', 'Report', 'Notify')) {
+    $rutaLib = Join-Path $raiz "lib\$archivo.ps1"
+    if (Test-Path $rutaLib) {
+        . $rutaLib
     }
-    catch { $estadoAnterior = @{} }
+    else {
+        Write-Host ("  Falta el archivo requerido: {0}" -f $rutaLib) -ForegroundColor Red
+        return
+    }
 }
 
-# Cache de fabricantes (OUI): evita repetir consultas a internet
+# ------------------------------------------------------------------
+# Configuracion (defaults < config.json < parametros de linea de comandos)
+# ------------------------------------------------------------------
+$rutaConfig = if ($Config) { $Config } else { Join-Path $raiz 'config.json' }
+
+if ($Config -and -not (Test-Path $rutaConfig)) {
+    Write-Host ("  No existe el archivo de configuracion: {0}" -f $rutaConfig) -ForegroundColor Red
+    return
+}
+
+$cfg = Get-ScanConfig -Ruta $rutaConfig
+
+if ($PSBoundParameters.ContainsKey('Red')) { $cfg.Red = $Red }
+if ($PSBoundParameters.ContainsKey('TimeoutMs')) { $cfg.TimeoutMs = $TimeoutMs }
+if ($PSBoundParameters.ContainsKey('Inicio')) { $cfg.Inicio = $Inicio }
+if ($PSBoundParameters.ContainsKey('Fin')) { $cfg.Fin = $Fin }
+if ($PSBoundParameters.ContainsKey('Carpeta')) { $cfg.CarpetaReportes = $Carpeta }
+if ($PSBoundParameters.ContainsKey('Puertos')) { $cfg.Puertos = $Puertos }
+if ($PSBoundParameters.ContainsKey('TimeoutPuertoMs')) { $cfg.TimeoutPuertoMs = $TimeoutPuertoMs }
+if ($PSBoundParameters.ContainsKey('Intervalo')) { $cfg.Intervalo = $Intervalo }
+if ($PSBoundParameters.ContainsKey('Veces')) { $cfg.Veces = $Veces }
+
+if ($EscanearPuertos) { $cfg.EscanearPuertos = $true }
+if ($SinPuertos) { $cfg.EscanearPuertos = $false }
+if ($Vigilar) { $cfg.Vigilar = $true }
+if ($SinCsv) { $cfg.GenerarCsv = $false }
+if ($SinHtml) { $cfg.GenerarHtml = $false }
+if ($SinHistorial) { $cfg.GuardarHistorial = $false }
+if ($SinEstado) { $cfg.CompararEstado = $false }
+if ($SinFabricante) { $cfg.UsarFabricantes = $false }
+
+if ([int]$cfg.Intervalo -lt 10) { $cfg.Intervalo = 10 }
+if ([int]$cfg.Veces -lt 0) { $cfg.Veces = 0 }
+
+# ------------------------------------------------------------------
+# Rutas de trabajo
+# ------------------------------------------------------------------
+$carpeta = Resolve-CarpetaReportes -Carpeta $cfg.CarpetaReportes
+
+$rutaEstado = Join-Path $carpeta 'estado-anterior.json'
+$rutaEstadisticas = Join-Path $carpeta 'historial-resumen.json'
+$rutaHistorialCsv = Join-Path $carpeta 'historial.csv'
 $rutaCacheOui = Join-Path $HOME '.scan-red-oui-cache.json'
+
 $cacheOui = @{}
 if (Test-Path $rutaCacheOui) {
     try {
@@ -95,349 +153,277 @@ if (Test-Path $rutaCacheOui) {
     catch { $cacheOui = @{} }
 }
 
-# ------------------------------------------------------------------
-# Utilidades
-# ------------------------------------------------------------------
-function Resolve-NombreDns {
-    param([string]$Ip, [int]$EsperaMs = 1500)
-    try {
-        $tarea = [System.Net.Dns]::GetHostEntryAsync($Ip)
-        if ($tarea.Wait($EsperaMs)) {
-            $entrada = $tarea.Result
-            if ($entrada -and $entrada.HostName) {
-                return ($entrada.HostName -split '\.')[0]
-            }
-        }
+function Resolve-RutaSalida {
+    param(
+        [string]$Ruta,
+        [string]$Carpeta,
+        [string]$Prefijo,
+        [datetime]$Fecha,
+        [string]$Extension
+    )
+
+    if (-not $Ruta) {
+        return (Join-Path $Carpeta ("{0}-{1:yyyyMMdd-HHmmss}.{2}" -f $Prefijo, $Fecha, $Extension))
     }
-    catch { }
-    return $null
-}
-
-function Resolve-NombreNetBios {
-    param([string]$Ip)
-    try {
-        $salida = & nbtstat -A $Ip 2>$null
-        foreach ($linea in $salida) {
-            if ($linea -match '^\s*(\S+)\s+<00>\s+UNIQUE') {
-                return $Matches[1]
-            }
-        }
+    if (-not [System.IO.Path]::IsPathRooted($Ruta)) {
+        return (Join-Path $Carpeta $Ruta)
     }
-    catch { }
-    return $null
-}
-
-function Get-Fabricante {
-    param([string]$Mac)
-
-    if ([string]::IsNullOrWhiteSpace($Mac)) { return '' }
-
-    # Se consulta por el prefijo OUI (primeros 3 octetos = 6 hex)
-    $oui = ($Mac -replace '-', '').ToUpper()
-    if ($oui.Length -lt 6) { return '' }
-    $oui = $oui.Substring(0, 6)
-
-    if ($cacheOui.ContainsKey($oui)) { return $cacheOui[$oui] }
-
-    $fabricante = ''
-
-    # Fuente 1: api.macvendors.com (respuesta en texto plano)
-    try {
-        $r = Invoke-RestMethod -Uri "https://api.macvendors.com/$oui" -TimeoutSec 8 `
-            -Headers @{ 'User-Agent' = 'scan-red-ps/1.0' }
-        if ($r) { $fabricante = "$r".Trim() }
+    if (Test-Path $Ruta -PathType Container) {
+        return (Join-Path $Ruta ("{0}-{1:yyyyMMdd-HHmmss}.{2}" -f $Prefijo, $Fecha, $Extension))
     }
-    catch { }
-
-    # Fuente 2 (respaldo): api.maclookup.app
-    if (-not $fabricante) {
-        try {
-            $r2 = Invoke-RestMethod -Uri "https://api.maclookup.app/v2/macs/$oui" -TimeoutSec 8
-            if ($r2.found -and $r2.company) { $fabricante = $r2.company }
-        }
-        catch { }
-    }
-
-    if (-not $fabricante) { $fabricante = 'Desconocido' }
-
-    $cacheOui[$oui] = $fabricante
-    Start-Sleep -Milliseconds 1100   # respeta el limite ~1 consulta/segundo del servicio
-    return $fabricante
+    return $Ruta
 }
 
 # ------------------------------------------------------------------
-# Fase 1: ping sweep en paralelo
+# Acciones rapidas: autorizar MACs / resumen de historial
+# ------------------------------------------------------------------
+if ($Autorizar) {
+    $lista = @($cfg.ListaBlanca)
+    $agregadas = @()
+    $invalidas = 0
+
+    foreach ($m in $Autorizar) {
+        $normalizada = ConvertTo-MacNormalizada -Mac $m
+        if ($normalizada -notmatch '^([0-9A-F]{2}-){5}[0-9A-F]{2}$') {
+            $invalidas++
+            Write-Host ("  MAC invalida (se ignora): {0}" -f $m) -ForegroundColor Yellow
+            continue
+        }
+        if ($lista -notcontains $normalizada) {
+            $lista += $normalizada
+            $agregadas += $normalizada
+        }
+    }
+
+    $cfg.ListaBlanca = $lista
+    Save-ScanConfig -Config $cfg -Ruta $rutaConfig
+
+    if ($agregadas.Count -gt 0) {
+        Write-Host ("  MAC(s) autorizada(s): {0}" -f ($agregadas -join ', ')) -ForegroundColor Green
+    }
+    elseif ($invalidas -eq 0) {
+        Write-Host "  Esas MAC(s) ya estaban autorizadas." -ForegroundColor Yellow
+    }
+    Write-Host ("  Configuracion guardada en: {0}" -f $rutaConfig) -ForegroundColor DarkGray
+    return
+}
+
+if ($ResumenHistorial) {
+    $stats = Read-Estadisticas -Ruta $rutaEstadisticas
+    Write-Host ""
+    Write-Host ("  Resumen historico ({0} escaneos)" -f $stats.Escaneos) -ForegroundColor Cyan
+    Write-Host ""
+    Show-ResumenHistorial -Estadisticas $stats
+    Write-Host ""
+    return
+}
+
+# ------------------------------------------------------------------
+# Bucle principal
 # ------------------------------------------------------------------
 Write-Host ""
-Write-Host ("  Escaneando {0}.{1} - {0}.{2} ..." -f $Red, $Inicio, $Fin) -ForegroundColor Cyan
+Write-Host "  Scan-Red - escaner de red local" -ForegroundColor Cyan
+Write-Host ("  Red: {0}.{1} - {0}.{2} | Reportes: {3}" -f $cfg.Red, $cfg.Inicio, $cfg.Fin, $carpeta) -ForegroundColor DarkGray
 Write-Host ""
 
-$inicioTiempo = Get-Date
-$msPorIp = @{}
+$iteracion = 0
+$primeraVuelta = $true
 
-$tareas = foreach ($n in $Inicio..$Fin) {
-    $ip = "$Red.$n"
-    $ping = [System.Net.NetworkInformation.Ping]::new()
-    [pscustomobject]@{
-        IP    = $ip
-        Ping  = $ping
-        Tarea = $ping.SendPingAsync($ip, $TimeoutMs)
+do {
+    $iteracion++
+    $horaInicio = Get-Date
+    $ahoraTexto = $horaInicio.ToString('yyyy-MM-dd HH:mm:ss')
+
+    # Estado del escaneo anterior
+    $estadoAnterior = @{}
+    $hayEstado = $false
+    if ($cfg.CompararEstado -and (Test-Path $rutaEstado)) {
+        $estadoAnterior = Read-Estado -Ruta $rutaEstado
+        $hayEstado = $true
     }
-}
 
-foreach ($t in $tareas) {
-    try {
-        $resp = $t.Tarea.GetAwaiter().GetResult()
-        if ($resp.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-            $msPorIp[$t.IP] = [int]$resp.RoundtripTime
+    Write-Host ("  [{0}] Escaneando..." -f $ahoraTexto) -ForegroundColor Cyan
+
+    $filas = @(Get-Dispositivos -Opciones $cfg -CacheOui $cacheOui -SinNombres:$SinNombres -NetBios:$NetBios)
+
+    # Autorizacion y MAC aleatoria
+    foreach ($f in $filas) {
+        if (-not $f.MAC) {
+            $f.Autorizado = '-'
         }
-    }
-    catch { }
-    finally { $t.Ping.Dispose() }
-}
-
-# ------------------------------------------------------------------
-# Fase 2: tabla ARP / vecinos -> MAC por IP
-# ------------------------------------------------------------------
-$macPorIp = @{}
-
-if (Get-Command Get-NetNeighbor -ErrorAction SilentlyContinue) {
-    Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.IPAddress -like "$Red.*" -and
-            $_.LinkLayerAddress -ne '00-00-00-00-00-00' -and
-            $_.LinkLayerAddress -ne 'FF-FF-FF-FF-FF-FF' -and
-            $_.State -in @('Reachable', 'Stale', 'Delay', 'Probe', 'Permanent')
-        } |
-        ForEach-Object { $macPorIp[$_.IPAddress] = $_.LinkLayerAddress.ToUpper() }
-}
-else {
-    foreach ($linea in (arp -a)) {
-        if ($linea -match '^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})') {
-            $macPorIp[$Matches[1]] = $Matches[2].ToUpper()
+        elseif (@($cfg.ListaBlanca) -contains $f.MAC) {
+            $f.Autorizado = 'Si'
         }
+        else {
+            $f.Autorizado = 'No'
+        }
+        $f.MacAleatoria = Test-MacAleatoria -Mac $f.MAC
     }
-}
 
-# ------------------------------------------------------------------
-# Fase 3: unir ping + ARP en una sola lista
-# ------------------------------------------------------------------
-$todasLasIp = ($msPorIp.Keys + $macPorIp.Keys) | Sort-Object -Unique | Sort-Object { [version]$_ }
+    # Comparacion con el estado anterior (agrupando por MAC)
+    $clavesActuales = @{}
+    $nuevos = [System.Collections.Generic.List[object]]::new()
+    $cambiosIp = [System.Collections.Generic.List[object]]::new()
+    $estadoNuevo = @{}
 
-$filas = @(foreach ($ip in $todasLasIp) {
-    [pscustomobject]@{
-        IP         = $ip
-        MAC        = if ($macPorIp.ContainsKey($ip)) { $macPorIp[$ip] } else { '' }
-        Nombre     = ''
-        Fabricante = ''
-        Estado     = if ($msPorIp.ContainsKey($ip)) { 'Activo' } else { 'Solo ARP' }
-        Ms         = if ($msPorIp.ContainsKey($ip)) { $msPorIp[$ip] } else { $null }
-        Clave      = ''
-        Cambio     = ''
-        PrimeraVez = ''
-        UltimoVisto= ''
+    foreach ($f in $filas) {
+        $f.Clave = if ($f.MAC) { $f.MAC } else { "IP:$($f.IP)" }
+        $f.UltimoVisto = $ahoraTexto
     }
-})
 
-# ------------------------------------------------------------------
-# Fase 4: resolver nombres (DNS inverso en paralelo + NetBIOS opcional)
-# ------------------------------------------------------------------
-$tareasDns = @{}
-foreach ($fila in $filas) {
-    try { $tareasDns[$fila.IP] = [System.Net.Dns]::GetHostEntryAsync($fila.IP) } catch { }
-}
+    foreach ($grupo in ($filas | Group-Object Clave)) {
+        $clave = $grupo.Name
+        $ipsActuales = @($grupo.Group | ForEach-Object { $_.IP } | Sort-Object { [version]$_ })
+        $primeraVez = $ahoraTexto
+        $cambio = 'NUEVO'
 
-foreach ($fila in $filas) {
-    $nombre = $null
-    if ($tareasDns.ContainsKey($fila.IP)) {
-        try {
-            if ($tareasDns[$fila.IP].Wait(1500)) {
-                $entrada = $tareasDns[$fila.IP].Result
-                if ($entrada -and $entrada.HostName) { $nombre = ($entrada.HostName -split '\.')[0] }
+        if ($estadoAnterior.ContainsKey($clave)) {
+            $cambio = 'Conocido'
+            $primeraVez = [string]$estadoAnterior[$clave].PrimeraVez
+
+            $ipsAntes = @()
+            if ($estadoAnterior[$clave].IPs) { $ipsAntes = @($estadoAnterior[$clave].IPs) }
+            elseif ($estadoAnterior[$clave].IP) { $ipsAntes = @($estadoAnterior[$clave].IP) }
+
+            $ipsNuevas = @($ipsActuales | Where-Object { $_ -notin $ipsAntes })
+            if ($ipsNuevas.Count -gt 0) {
+                $cambiosIp.Add([pscustomobject]@{
+                        Antes      = ($ipsAntes -join ', ')
+                        Ahora      = ($ipsActuales -join ', ')
+                        Fabricante = $grupo.Group[0].Fabricante
+                    })
             }
         }
-        catch { }
+        else {
+            $nuevos.Add($grupo.Group[0])
+        }
+
+        foreach ($f in $grupo.Group) {
+            $f.Cambio = $cambio
+            $f.PrimeraVez = $primeraVez
+        }
+
+        $clavesActuales[$clave] = $true
+
+        $nombreGrupo = ($grupo.Group | Where-Object { $_.Nombre } | Select-Object -First 1).Nombre
+        if (-not $nombreGrupo) { $nombreGrupo = '' }
+
+        $estadoNuevo[$clave] = [pscustomobject]@{
+            IPs        = $ipsActuales
+            MAC        = $grupo.Group[0].MAC
+            Nombre     = $nombreGrupo
+            Fabricante = $grupo.Group[0].Fabricante
+            PrimeraVez = $primeraVez
+            UltimoVisto= $ahoraTexto
+        }
     }
-    if (-not $nombre -and $NetBios) {
-        $nombre = Resolve-NombreNetBios -Ip $fila.IP
+
+    $desaparecidos = @(foreach ($k in $estadoAnterior.Keys) {
+            if (-not $clavesActuales.ContainsKey($k)) {
+                $ipsAntes = if ($estadoAnterior[$k].IPs) { (@($estadoAnterior[$k].IPs) -join ', ') } else { $estadoAnterior[$k].IP }
+                [pscustomobject]@{
+                    IP         = $ipsAntes
+                    MAC        = $estadoAnterior[$k].MAC
+                    Nombre     = $estadoAnterior[$k].Nombre
+                    Fabricante = $estadoAnterior[$k].Fabricante
+                    UltimoVisto= $estadoAnterior[$k].UltimoVisto
+                }
+            }
+        })
+
+    # Sin comparacion de estado no tiene sentido hablar de nuevos/desaparecidos
+    if (-not $cfg.CompararEstado) {
+        $nuevos.Clear()
+        $cambiosIp.Clear()
+        $desaparecidos = @()
+        foreach ($f in $filas) { $f.Cambio = '-' }
     }
-    if ($nombre) { $fila.Nombre = $nombre }
-}
 
-# ------------------------------------------------------------------
-# Fase 4b: fabricante por MAC (OUI) con cache local
-# ------------------------------------------------------------------
-if (-not $SinFabricante) {
-    $conMac = @($filas | Where-Object { $_.MAC })
-    $pendientes = @($conMac | Where-Object { -not $cacheOui.ContainsKey((($_.MAC -replace '-', '').Substring(0, 6))) })
-
-    if ($pendientes.Count -gt 0) {
-        Write-Host ("  Consultando fabricantes ({0} nuevos, ~{1} s) ..." -f `
-                $pendientes.Count, [math]::Round($pendientes.Count * 1.1)) -ForegroundColor DarkGray
+    # Historial y presencia
+    if ($cfg.GuardarHistorial) {
+        $stats = Read-Estadisticas -Ruta $rutaEstadisticas
+        Update-Estadisticas -Estadisticas $stats -Filas $filas
+        Save-Estadisticas -Estadisticas $stats -Ruta $rutaEstadisticas
+        Add-Historial -Ruta $rutaHistorialCsv -Filas $filas -Fecha $ahoraTexto
     }
 
-    foreach ($fila in $filas) {
-        if ($fila.MAC) { $fila.Fabricante = Get-Fabricante -Mac $fila.MAC }
+    $duracion = (Get-Date) - $horaInicio
+    $activos = @($filas | Where-Object { $_.Estado -eq 'Activo' })
+    $autorizados = @($filas | Where-Object { $_.Autorizado -eq 'Si' })
+
+    # ------------------------------------------------------------------
+    # Salida en consola
+    # ------------------------------------------------------------------
+    Write-Host ""
+    Write-Host ("  Equipo: {0}" -f [System.Net.Dns]::GetHostName()) -ForegroundColor DarkGray
+    Write-Host ("  Activos: {0} | En ARP: {1} | Autorizados: {2} | Nuevos: {3} | Desaparecidos: {4} | {5:N1} s" -f `
+            $activos.Count, $filas.Count, $autorizados.Count, @($nuevos).Count, @($desaparecidos).Count, $duracion.TotalSeconds) -ForegroundColor Yellow
+
+    if (-not $hayEstado -and $cfg.CompararEstado) {
+        Write-Host "  Linea base creada (primer escaneo con estado)." -ForegroundColor DarkGray
     }
+    Write-Host ""
 
-    try { $cacheOui | ConvertTo-Json | Set-Content -Path $rutaCacheOui -Encoding UTF8 } catch { }
-}
-
-# ------------------------------------------------------------------
-# Fase 5: comparar con el escaneo anterior (nuevos / desaparecidos)
-# ------------------------------------------------------------------
-$ahora = Get-Date
-$ahoraTexto = $ahora.ToString('yyyy-MM-dd HH:mm:ss')
-$clavesActuales = @{}
-$nuevos = [System.Collections.Generic.List[object]]::new()
-$cambiosIp = [System.Collections.Generic.List[object]]::new()
-$estadoNuevo = @{}
-
-# Clave estable por dispositivo: la MAC; si no hay MAC, la IP
-foreach ($fila in $filas) {
-    $fila.Clave = if ($fila.MAC) { $fila.MAC } else { "IP:$($fila.IP)" }
-    $fila.UltimoVisto = $ahoraTexto
-}
-
-# Agrupar por dispositivo (una misma MAC puede tener mas de una IP)
-foreach ($grupo in ($filas | Group-Object Clave)) {
-    $clave = $grupo.Name
-    $ipsActuales = @($grupo.Group | ForEach-Object { $_.IP } | Sort-Object { [version]$_ })
-    $primeraVez = $ahoraTexto
-    $cambio = 'NUEVO'
-
-    if ($estadoAnterior.ContainsKey($clave)) {
-        $cambio = 'Conocido'
-        $primeraVez = [string]$estadoAnterior[$clave].PrimeraVez
-
-        # Compatibilidad con el formato antiguo (IP suelta) y el nuevo (IPs)
-        $ipsAntes = @()
-        if ($estadoAnterior[$clave].IPs) { $ipsAntes = @($estadoAnterior[$clave].IPs) }
-        elseif ($estadoAnterior[$clave].IP) { $ipsAntes = @($estadoAnterior[$clave].IP) }
-
-        $ipsNuevas = @($ipsActuales | Where-Object { $_ -notin $ipsAntes })
-        if ($ipsNuevas.Count -gt 0) {
-            $cambiosIp.Add([pscustomobject]@{
-                    Antes      = ($ipsAntes -join ', ')
-                    Ahora      = ($ipsActuales -join ', ')
-                    Fabricante = $grupo.Group[0].Fabricante
-                })
+    if ($primeraVuelta -or -not $cfg.Vigilar) {
+        Show-TablaDispositivos -Filas $filas
+        if ($cfg.CompararEstado) {
+            Show-AlertasConsola -Nuevos $nuevos -Desaparecidos $desaparecidos -CambiosIp $cambiosIp
         }
     }
     else {
-        $nuevos.Add($grupo.Group[0])
+        Show-AlertasConsola -Nuevos $nuevos -Desaparecidos $desaparecidos -CambiosIp $cambiosIp
     }
 
-    foreach ($f in $grupo.Group) {
-        $f.Cambio = $cambio
-        $f.PrimeraVez = $primeraVez
-    }
-
-    $clavesActuales[$clave] = $true
-
-    $nombreGrupo = ($grupo.Group | Where-Object { $_.Nombre } | Select-Object -First 1).Nombre
-    if (-not $nombreGrupo) { $nombreGrupo = '' }
-
-    $estadoNuevo[$clave] = [pscustomobject]@{
-        IPs        = $ipsActuales
-        MAC        = $grupo.Group[0].MAC
-        Nombre     = $nombreGrupo
-        Fabricante = $grupo.Group[0].Fabricante
-        PrimeraVez = $primeraVez
-        UltimoVisto= $ahoraTexto
-    }
-}
-
-$desaparecidos = @(foreach ($k in $estadoAnterior.Keys) {
-        if (-not $clavesActuales.ContainsKey($k)) {
-            $ipsAntes = if ($estadoAnterior[$k].IPs) { (@($estadoAnterior[$k].IPs) -join ', ') } else { $estadoAnterior[$k].IP }
-            [pscustomobject]@{
-                IP         = $ipsAntes
-                MAC        = $estadoAnterior[$k].MAC
-                Nombre     = $estadoAnterior[$k].Nombre
-                Fabricante = $estadoAnterior[$k].Fabricante
-                UltimoVisto= $estadoAnterior[$k].UltimoVisto
-            }
+    # ------------------------------------------------------------------
+    # Notificaciones (solo si habia estado previo con el que comparar)
+    # ------------------------------------------------------------------
+    if ($hayEstado) {
+        $alertados = Send-Alertas -Nuevos $nuevos -Cfg $cfg -Carpeta $carpeta
+        if ($alertados -gt 0) {
+            Write-Host ("  Alertas enviadas: {0}" -f $alertados) -ForegroundColor DarkGray
         }
-    })
-
-$duracion = (Get-Date) - $inicioTiempo
-$activos = @($filas | Where-Object { $_.Estado -eq 'Activo' })
-
-# ------------------------------------------------------------------
-# Fase 6: mostrar resultados
-# ------------------------------------------------------------------
-Write-Host ""
-Write-Host ("  Equipo: {0}" -f [System.Net.Dns]::GetHostName()) -ForegroundColor DarkGray
-Write-Host ("  Activos: {0}   |   En tabla ARP: {1}   |   Tiempo: {2:N1} s" -f `
-        $activos.Count, $filas.Count, $duracion.TotalSeconds) -ForegroundColor Yellow
-
-if ($hayHistorial) {
-    Write-Host ("  Nuevos: {0}   |   Desaparecidos: {1}" -f $nuevos.Count, $desaparecidos.Count) -ForegroundColor Yellow
-}
-elseif (-not $SinHistorial) {
-    Write-Host "  Primera ejecucion con historial: se creo la linea base." -ForegroundColor DarkGray
-}
-Write-Host ""
-
-Write-Host "  Dispositivos encontrados:" -ForegroundColor Cyan
-$filas |
-    Select-Object IP, MAC, Nombre, Fabricante, Estado, Cambio, Ms |
-    Format-Table -AutoSize |
-    Out-Host
-
-# Alertas
-if ($hayHistorial -and $nuevos.Count -gt 0) {
-    Write-Host "  [!] DISPOSITIVOS NUEVOS (no estaban en el escaneo anterior):" -ForegroundColor Yellow
-    foreach ($n in $nuevos) {
-        Write-Host ("      {0,-15} {1,-18} {2}" -f $n.IP, $n.MAC, $n.Fabricante) -ForegroundColor Yellow
-    }
-    Write-Host ""
-}
-
-if ($hayHistorial -and $desaparecidos.Count -gt 0) {
-    Write-Host "  [i] DESAPARECIDOS (estaban antes y ya no aparecen):" -ForegroundColor DarkYellow
-    foreach ($d in $desaparecidos) {
-        Write-Host ("      {0,-15} {1,-18} {2}  (visto: {3})" -f `
-                $d.IP, $d.MAC, $d.Fabricante, $d.UltimoVisto) -ForegroundColor DarkYellow
-    }
-    Write-Host ""
-}
-
-if ($hayHistorial -and $cambiosIp.Count -gt 0) {
-    Write-Host "  [i] Cambios de IP del mismo dispositivo:" -ForegroundColor DarkCyan
-    foreach ($c in $cambiosIp) {
-        Write-Host ("      {0} -> {1}   {2}" -f $c.Antes, $c.IP, $c.Fabricante) -ForegroundColor DarkCyan
-    }
-    Write-Host ""
-}
-
-# ------------------------------------------------------------------
-# Fase 7: exportar CSV + guardar historial
-# ------------------------------------------------------------------
-if (-not $SinCsv) {
-    $ruta = $Csv
-    if (-not $ruta) {
-        $ruta = Join-Path $Carpeta ("scan-red-{0:yyyyMMdd-HHmmss}.csv" -f $ahora)
-    }
-    elseif (-not [System.IO.Path]::IsPathRooted($ruta)) {
-        $ruta = Join-Path $Carpeta $ruta
-    }
-    elseif (Test-Path $ruta -PathType Container) {
-        $ruta = Join-Path $ruta ("scan-red-{0:yyyyMMdd-HHmmss}.csv" -f $ahora)
     }
 
-    $filas | Select-Object IP, MAC, Nombre, Fabricante, Estado, Ms, PrimeraVez, UltimoVisto, Cambio |
-        Export-Csv -Path $ruta -NoTypeInformation -Encoding UTF8
+    # ------------------------------------------------------------------
+    # Reportes (en modo vigilancia solo cuando hay cambios)
+    # ------------------------------------------------------------------
+    $huboCambios = (@($nuevos).Count -gt 0) -or (@($desaparecidos).Count -gt 0) -or (@($cambiosIp).Count -gt 0)
+    $generar = (-not $cfg.Vigilar) -or $primeraVuelta -or $huboCambios
 
-    Write-Host ("  Reporte guardado en: {0}" -f $ruta) -ForegroundColor Green
-}
+    if ($generar) {
+        if ($cfg.GenerarCsv) {
+            $rutaCsv = Resolve-RutaSalida -Ruta $Csv -Carpeta $carpeta -Prefijo 'scan-red' -Fecha $horaInicio -Extension 'csv'
+            Export-CsvReporte -Filas $filas -Ruta $rutaCsv
+            Write-Host ("  CSV : {0}" -f $rutaCsv) -ForegroundColor Green
+        }
 
-if (-not $SinHistorial) {
+        if ($cfg.GenerarHtml) {
+            $rutaHtml = Resolve-RutaSalida -Ruta $Html -Carpeta $carpeta -Prefijo 'reporte' -Fecha $horaInicio -Extension 'html'
+            Export-HtmlReporte -Filas $filas -Nuevos $nuevos -Desaparecidos $desaparecidos -CambiosIp $cambiosIp `
+                -Opciones $cfg -DuracionSeg $duracion.TotalSeconds -Ruta $rutaHtml -Equipo ([System.Net.Dns]::GetHostName())
+            Write-Host ("  HTML: {0}" -f $rutaHtml) -ForegroundColor Green
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Persistir estado y cache
+    # ------------------------------------------------------------------
+    if ($cfg.CompararEstado) {
+        Save-Estado -Estado $estadoNuevo -Ruta $rutaEstado
+    }
+
     try {
-        $estadoNuevo | ConvertTo-Json -Depth 5 | Set-Content -Path $rutaEstado -Encoding UTF8
-        Write-Host ("  Historial actualizado: {0}" -f $rutaEstado) -ForegroundColor DarkGray
+        $cacheOui | ConvertTo-Json | Set-Content -Path $rutaCacheOui -Encoding UTF8
     }
     catch { }
-}
-Write-Host ""
+
+    Write-Host ""
+
+    $primeraVuelta = $false
+
+    if (-not $cfg.Vigilar) { break }
+    if ([int]$cfg.Veces -gt 0 -and $iteracion -ge [int]$cfg.Veces) { break }
+
+    Write-Host ("  Proximo escaneo en {0} s (Ctrl+C para salir)." -f $cfg.Intervalo) -ForegroundColor DarkGray
+    Start-Sleep -Seconds ([int]$cfg.Intervalo)
+} while ($true)
